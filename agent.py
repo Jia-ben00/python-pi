@@ -1,8 +1,9 @@
-"""Stage 2: Tool registry with @tool decorator + practical tools."""
+"""Stage 3: Error handling, retries, and loop guard."""
 import inspect
 import json
 import os
 import subprocess
+import time
 from openai import OpenAI
 
 # ---------- tool registry ----------
@@ -62,6 +63,10 @@ def run_shell(cmd: str) -> str:
     output = result.stdout + result.stderr
     return output.strip() or f"(exit code {result.returncode}, no output)"
 
+# ---------- constants ----------
+MAX_TURNS = 20
+MAX_RETRIES = 3
+
 # ---------- agent ----------
 class Agent:
     def __init__(self, system_prompt, model=None):
@@ -69,19 +74,42 @@ class Agent:
         self.model = model or os.getenv("MODEL", "gpt-4o-mini")
         self.messages = [{"role": "system", "content": system_prompt}]
 
+    def _chat_with_retry(self):
+        """Call LLM with exponential backoff retry on failure."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return self.client.chat.completions.create(
+                    model=self.model, messages=self.messages, tools=TOOLS
+                )
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                wait = 2 ** attempt
+                print(f"\n[retry] API error: {e}, retrying in {wait}s...")
+                time.sleep(wait)
+
     def chat(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
-        while True:
-            resp = self.client.chat.completions.create(
-                model=self.model, messages=self.messages, tools=TOOLS
-            )
+        for turn in range(MAX_TURNS):
+            resp = self._chat_with_retry()
             msg = resp.choices[0].message
             self.messages.append(msg.model_dump(exclude_none=True))
             if not msg.tool_calls:
                 return msg.content
             for tc in msg.tool_calls:
-                result = FUNCS[tc.function.name](**json.loads(tc.function.arguments))
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    result = f"Error: invalid JSON arguments: {e}"
+                else:
+                    try:
+                        result = FUNCS[tc.function.name](**args)
+                    except KeyError:
+                        result = f"Error: unknown tool '{tc.function.name}'"
+                    except Exception as e:
+                        result = f"Error: {type(e).__name__}: {e}"
                 self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+        return "[stopped] reached maximum number of turns"
 
 # ---------- REPL ----------
 def main():
